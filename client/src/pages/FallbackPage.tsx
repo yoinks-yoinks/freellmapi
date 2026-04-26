@@ -66,6 +66,7 @@ const platformColors: Record<string, string> = {
   cohere:      '#d946ef',
   cloudflare:  '#f38020',
   zhipu:       '#06b6d4',
+  deepseek:    '#4d6bfe',
 }
 
 function TokenUsageBar({ data }: { data: TokenUsageData }) {

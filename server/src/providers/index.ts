@@ -86,6 +86,14 @@ register(new OpenAICompatProvider({
 // HF tool-call format issues; Moonshot moved to paid; MiniMax superseded by
 // the OpenRouter route (openrouter/minimax/minimax-m2.5:free).
 
+// DeepSeek - OpenAI-compatible
+register(new OpenAICompatProvider({
+  platform: 'deepseek',
+  name: 'DeepSeek',
+  baseUrl: 'https://api.deepseek.com',
+}));
+
+
 export function getProvider(platform: Platform): BaseProvider | undefined {
   return providers.get(platform);
 }

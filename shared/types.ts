@@ -15,7 +15,8 @@ export type Platform =
   | 'github'
   | 'cohere'
   | 'cloudflare'
-  | 'zhipu';
+  | 'zhipu'
+  | 'deepseek';
 
 export interface Model {
   id: number;
@@ -145,6 +146,7 @@ export interface ChatCompletionResponse {
     platform: Platform;
     model: string;
   };
+  system_fingerprint?: string;
 }
 
 export interface ChatCompletionChunk {
@@ -161,6 +163,7 @@ export interface ChatCompletionChunk {
     };
     finish_reason: string | null;
   }[];
+  system_fingerprint?: string;
 }
 
 // ---- Analytics Types ----
