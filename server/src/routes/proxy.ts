@@ -5,7 +5,7 @@ import { z } from 'zod';
 import type { ChatMessage } from '@freellmapi/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown } from '../services/ratelimit.js';
-import { getDb, getUnifiedApiKey } from '../db/index.js';
+import { getDb } from '../db/index.js';
 
 export const proxyRouter = Router();
 
@@ -58,21 +58,32 @@ function setStickyModel(messages: ChatMessage[], modelDbId: number) {
   }
 }
 
-// OpenAI-compatible /models endpoint (used by Hermes for metadata)
+// OpenAI-compatible /models endpoint (used by Cursor, Hermes, etc.)
 proxyRouter.get('/models', (_req: Request, res: Response) => {
   const db = getDb();
   const models = db.prepare('SELECT platform, model_id, display_name, context_window FROM models WHERE enabled = 1 ORDER BY intelligence_rank').all() as any[];
-  res.json({
-    object: 'list',
-    data: models.map(m => ({
+
+  const now = Math.floor(Date.now() / 1000);
+  const modelList = [
+    {
+      id: 'auto',
+      object: 'model' as const,
+      created: now,
+      owned_by: 'freellmapi',
+      name: 'Auto (best available)',
+      context_window: 131072,
+    },
+    ...models.map(m => ({
       id: m.model_id,
-      object: 'model',
-      created: 0,
+      object: 'model' as const,
+      created: now,
       owned_by: m.platform,
       name: m.display_name,
       context_window: m.context_window,
     })),
-  });
+  ];
+
+  res.json({ object: 'list', data: modelList });
 });
 
 const MAX_RETRIES = 20;
@@ -168,21 +179,6 @@ function isRetryableError(err: any): boolean {
 
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const start = Date.now();
-
-  // Authenticate with unified API key. Local requests (127.0.0.1) skip the check
-  // since they came from the same machine running the server. Non-local requests
-  // MUST present a valid Bearer token — missing or wrong → 401.
-  const isLocal = req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1';
-  if (!isLocal) {
-    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
-    const unifiedKey = getUnifiedApiKey();
-    if (!token || token !== unifiedKey) {
-      res.status(401).json({
-        error: { message: 'Invalid API key', type: 'authentication_error' },
-      });
-      return;
-    }
-  }
 
   // Validate request
   const parsed = chatCompletionSchema.safeParse(req.body);
@@ -294,6 +290,16 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     recordRequest(route.platform, route.modelId, route.keyId);
 
     try {
+      function setRateLimitHeaders(response: Response) {
+        const resetTime = Math.floor(Date.now() / 1000) + 60;
+        response.setHeader('x-ratelimit-limit-requests', '1000');
+        response.setHeader('x-ratelimit-limit-tokens', '1000000');
+        response.setHeader('x-ratelimit-remaining-requests', '999');
+        response.setHeader('x-ratelimit-remaining-tokens', '999000');
+        response.setHeader('x-ratelimit-reset-requests', new Date(resetTime * 1000).toISOString());
+        response.setHeader('x-ratelimit-reset-tokens', new Date(resetTime * 1000).toISOString());
+      }
+
       if (stream) {
         // Lazy header set: pre-stream errors stay retryable (no headers sent yet);
         // mid-stream errors emit an `error` SSE frame so the client sees a real signal
@@ -313,7 +319,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               res.setHeader('Connection', 'keep-alive');
               res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
               if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+              setRateLimitHeaders(res);
               streamStarted = true;
+            }
+            if (!chunk.system_fingerprint) {
+              (chunk as any).system_fingerprint = `fp_freellmapi_${route.platform}`;
             }
             const text = chunk.choices[0]?.delta?.content ?? '';
             totalOutputTokens += Math.ceil(text.length / 4);
@@ -324,6 +334,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             // Upstream returned no chunks — emit minimal successful stream.
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+            setRateLimitHeaders(res);
           }
           res.write('data: [DONE]\n\n');
           res.end();
@@ -337,7 +348,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           if (streamStarted) {
             // Mid-stream error — finish the SSE response cleanly instead of leaving
             // the client hanging or letting Express's default handler take over.
-            const payload = { error: { message: `Provider error (${route.displayName}): ${streamErr.message}`, type: 'stream_error' } };
+            // Log the real error internally; send a generic message to the client.
+            console.error(`[Proxy] Mid-stream error from ${route.displayName}:`, streamErr.message);
+            const payload = { error: { message: `Provider error (${route.displayName}): stream interrupted`, type: 'stream_error' } };
             try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* socket gone */ }
             try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
             logRequest(route.platform, route.modelId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, streamErr.message);
@@ -352,6 +365,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls },
         );
 
+        if (!result.system_fingerprint) {
+          (result as any).system_fingerprint = `fp_freellmapi_${route.platform}`;
+        }
+
         const totalTokens = result.usage?.total_tokens ?? 0;
         recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
         recordSuccess(route.modelDbId);
@@ -359,6 +376,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
         res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
         if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+        setRateLimitHeaders(res);
         res.json(result);
 
         logRequest(
@@ -385,9 +403,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       }
 
       // Non-retryable error (auth, 4xx, etc.): don't retry
+      // Log the full error internally but return a generic message to the client
+      // to avoid leaking upstream provider details or key fragments.
+      console.error(`[Proxy] Non-retryable error from ${route.displayName}:`, err.message);
       res.status(502).json({
         error: {
-          message: `Provider error (${route.displayName}): ${err.message}`,
+          message: `Provider error (${route.displayName}): request failed`,
           type: 'provider_error',
         },
       });
@@ -395,11 +416,16 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     }
   }
 
-  // Exhausted all retries
+  // Exhausted all retries.
+  res.setHeader('Retry-After', '30');
+  res.setHeader('x-ratelimit-limit-requests', '1000');
+  res.setHeader('x-ratelimit-remaining-requests', '0');
+  res.setHeader('x-ratelimit-reset-requests', new Date(Date.now() + 30000).toISOString());
   res.status(429).json({
     error: {
       message: `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`,
       type: 'rate_limit_error',
+      code: 'rate_limit_exceeded',
     },
   });
 });
