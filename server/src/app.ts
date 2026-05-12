@@ -35,8 +35,9 @@ export function createApp() {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
   });
 
-  // All API routes require the unified API key
-  app.use('/api', requireApiKey);
+  // Dashboard/admin routes stay same-origin and are typically protected by the
+  // fronting reverse proxy. Keep unified API key auth on /v1 so the browser UI
+  // can still bootstrap and manage provider keys without a circular dependency.
   app.use('/api/keys', keysRouter);
   app.use('/api/models', modelsRouter);
   app.use('/api/fallback', fallbackRouter);
