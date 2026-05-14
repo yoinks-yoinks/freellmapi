@@ -147,6 +147,22 @@ export class OpenAICompatProvider extends BaseProvider {
     }, 10000);
     return res.status !== 401 && res.status !== 403;
   }
+
+  /** Fetch the live model list from the provider's /models endpoint. */
+  async listModels(apiKey: string): Promise<string[]> {
+    const res = await this.fetchWithTimeout(`${this.baseUrl}/models`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        ...this.extraHeaders,
+      },
+    }, 15000);
+    if (!res.ok) {
+      throw new Error(`${this.name} API error ${res.status}: ${res.statusText}`);
+    }
+    const data = await res.json() as { data?: Array<{ id: string }> };
+    return (data.data ?? []).map(m => m.id);
+  }
 }
 
 /**
